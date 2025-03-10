@@ -1,7 +1,10 @@
-from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi import FastAPI, Depends, HTTPException, status, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from sqlalchemy import create_engine, Column, Integer, String
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from sqlalchemy import create_engine, Column, Integer, String, Boolean
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 from pydantic import BaseModel, EmailStr
@@ -10,6 +13,10 @@ from jose import JWTError, jwt
 from datetime import datetime, timedelta
 from typing import Optional
 import os
+import secrets
+import aiosmtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 
 SQLALCHEMY_DATABASE_URL = "sqlite:///./users.db"
 engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False})
@@ -19,12 +26,26 @@ Base = declarative_base()
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-this-in-production")
+REFRESH_SECRET_KEY = os.getenv("REFRESH_SECRET_KEY", "your-refresh-secret-key-change-this-in-production")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
+REFRESH_TOKEN_EXPIRE_DAYS = 7
+
+# Email configuration
+SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+SMTP_FROM_EMAIL = os.getenv("SMTP_FROM_EMAIL", "noreply@example.com")
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
+# Rate limiter
+limiter = Limiter(key_func=get_remote_address)
 app = FastAPI(title="Authentication API")
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 app.add_middleware(
     CORSMiddleware,
@@ -41,6 +62,9 @@ class User(Base):
     email = Column(String, unique=True, index=True)
     username = Column(String, unique=True, index=True)
     hashed_password = Column(String)
+    is_verified = Column(Boolean, default=False)
+    verification_token = Column(String, nullable=True)
+    refresh_token = Column(String, nullable=True)
 
 Base.metadata.create_all(bind=engine)
 
@@ -59,10 +83,20 @@ class UserResponse(BaseModel):
 
 class Token(BaseModel):
     access_token: str
+    refresh_token: str
     token_type: str
+
+class RefreshTokenRequest(BaseModel):
+    refresh_token: str
 
 class TokenData(BaseModel):
     username: Optional[str] = None
+
+class EmailVerificationRequest(BaseModel):
+    token: str
+
+class ResendVerificationRequest(BaseModel):
+    email: EmailStr
 
 def get_db():
     db = SessionLocal()
@@ -83,9 +117,68 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
         expire = datetime.utcnow() + expires_delta
     else:
         expire = datetime.utcnow() + timedelta(minutes=15)
-    to_encode.update({"exp": expire})
+    to_encode.update({"exp": expire, "type": "access"})
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
+
+def create_refresh_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(days=7)
+    to_encode.update({"exp": expire, "type": "refresh"})
+    encoded_jwt = jwt.encode(to_encode, REFRESH_SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+async def send_verification_email(email: str, token: str):
+    """Send verification email to user"""
+    if not SMTP_USER or not SMTP_PASSWORD:
+        # In development, just print the token
+        print(f"Verification token for {email}: {token}")
+        print(f"Verification URL: {FRONTEND_URL}/verify-email?token={token}")
+        return
+    
+    try:
+        message = MIMEMultipart("alternative")
+        message["Subject"] = "Verify Your Email Address"
+        message["From"] = SMTP_FROM_EMAIL
+        message["To"] = email
+        
+        verification_url = f"{FRONTEND_URL}/verify-email?token={token}"
+        
+        text = f"""Please verify your email address by clicking the link below:
+{verification_url}
+
+Or copy this token: {token}
+"""
+        
+        html = f"""<html>
+<body>
+<h2>Verify Your Email Address</h2>
+<p>Please verify your email address by clicking the link below:</p>
+<p><a href="{verification_url}">Verify Email</a></p>
+<p>Or copy this token: <code>{token}</code></p>
+</body>
+</html>"""
+        
+        part1 = MIMEText(text, "plain")
+        part2 = MIMEText(html, "html")
+        message.attach(part1)
+        message.attach(part2)
+        
+        await aiosmtplib.send(
+            message,
+            hostname=SMTP_HOST,
+            port=SMTP_PORT,
+            username=SMTP_USER,
+            password=SMTP_PASSWORD,
+            start_tls=True,
+        )
+    except Exception as e:
+        print(f"Error sending email: {e}")
+        # In development, just print the token
+        print(f"Verification token for {email}: {token}")
 
 def get_user_by_email(db: Session, email: str):
     return db.query(User).filter(User.email == email).first()
@@ -109,6 +202,8 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = De
     )
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        if payload.get("type") != "access":
+            raise credentials_exception
         username: str = payload.get("sub")
         if username is None:
             raise credentials_exception
@@ -121,24 +216,42 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = De
     return user
 
 @app.post("/register", response_model=UserResponse)
-def register(user: UserCreate, db: Session = Depends(get_db)):
+@limiter.limit("5/minute")
+async def register(request: Request, user: UserCreate, db: Session = Depends(get_db)):
+    log_info(f"Registration attempt for email: {user.email}")
     db_user_email = get_user_by_email(db, email=user.email)
     if db_user_email:
+        log_warning(f"Registration failed: Email already registered - {user.email}")
         raise HTTPException(status_code=400, detail="Email already registered")
     
     db_user_username = get_user_by_username(db, username=user.username)
     if db_user_username:
+        log_warning(f"Registration failed: Username already taken - {user.username}")
         raise HTTPException(status_code=400, detail="Username already taken")
     
     hashed_password = get_password_hash(user.password)
-    db_user = User(email=user.email, username=user.username, hashed_password=hashed_password)
+    verification_token = secrets.token_urlsafe(32)
+    
+    db_user = User(
+        email=user.email, 
+        username=user.username, 
+        hashed_password=hashed_password,
+        is_verified=False,
+        verification_token=verification_token
+    )
     db.add(db_user)
     db.commit()
     db.refresh(db_user)
+    
+    # Send verification email
+    await send_verification_email(user.email, verification_token)
+    log_info(f"User registered successfully: {user.username}")
+    
     return db_user
 
 @app.post("/token", response_model=Token)
-async def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+@limiter.limit("10/minute")
+async def login(request: Request, form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
     user = authenticate_user(db, form_data.username, form_data.password)
     if not user:
         raise HTTPException(
@@ -146,14 +259,115 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = 
             detail="Incorrect username or password",
             headers={"WWW-Authenticate": "Bearer"},
         )
+    
+    if not user.is_verified:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Email not verified. Please check your email for verification link."
+        )
+    
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    refresh_token_expires = timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+    
     access_token = create_access_token(
         data={"sub": user.username}, expires_delta=access_token_expires
     )
-    return {"access_token": access_token, "token_type": "bearer"}
+    refresh_token = create_refresh_token(
+        data={"sub": user.username}, expires_delta=refresh_token_expires
+    )
+    
+    # Store refresh token in database
+    user.refresh_token = refresh_token
+    db.commit()
+    
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer"
+    }
+
+@app.post("/refresh", response_model=Token)
+@limiter.limit("10/minute")
+async def refresh_token(request: Request, token_data: RefreshTokenRequest, db: Session = Depends(get_db)):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate refresh token",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token_data.refresh_token, REFRESH_SECRET_KEY, algorithms=[ALGORITHM])
+        if payload.get("type") != "refresh":
+            raise credentials_exception
+        username: str = payload.get("sub")
+        if username is None:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+    
+    user = get_user_by_username(db, username=username)
+    if user is None or user.refresh_token != token_data.refresh_token:
+        raise credentials_exception
+    
+    # Create new tokens
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    refresh_token_expires = timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+    
+    access_token = create_access_token(
+        data={"sub": user.username}, expires_delta=access_token_expires
+    )
+    new_refresh_token = create_refresh_token(
+        data={"sub": user.username}, expires_delta=refresh_token_expires
+    )
+    
+    # Update refresh token in database
+    user.refresh_token = new_refresh_token
+    db.commit()
+    
+    return {
+        "access_token": access_token,
+        "refresh_token": new_refresh_token,
+        "token_type": "bearer"
+    }
+
+@app.post("/verify-email")
+@limiter.limit("5/minute")
+async def verify_email(request: Request, verification: EmailVerificationRequest, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.verification_token == verification.token).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Invalid verification token")
+    
+    if user.is_verified:
+        raise HTTPException(status_code=400, detail="Email already verified")
+    
+    user.is_verified = True
+    user.verification_token = None
+    db.commit()
+    
+    return {"message": "Email verified successfully"}
+
+@app.post("/resend-verification")
+@limiter.limit("3/minute")
+async def resend_verification(request: Request, email_data: ResendVerificationRequest, db: Session = Depends(get_db)):
+    email = email_data.email
+    user = get_user_by_email(db, email=email)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    if user.is_verified:
+        raise HTTPException(status_code=400, detail="Email already verified")
+    
+    # Generate new verification token
+    verification_token = secrets.token_urlsafe(32)
+    user.verification_token = verification_token
+    db.commit()
+    
+    await send_verification_email(user.email, verification_token)
+    
+    return {"message": "Verification email sent"}
 
 @app.get("/users/me", response_model=UserResponse)
-async def read_users_me(current_user: User = Depends(get_current_user)):
+@limiter.limit("30/minute")
+async def read_users_me(request: Request, current_user: User = Depends(get_current_user)):
     return current_user
 
 @app.get("/")
