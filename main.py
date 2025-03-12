@@ -416,3 +416,12 @@ async def read_users_me(request: Request, current_user: User = Depends(get_curre
 async def root():
     return {"message": "Authentication API is running"}
 
+@app.get("/health")
+async def health_check():
+    """Health check endpoint for monitoring"""
+    return {
+        "status": "healthy",
+        "timestamp": datetime.utcnow().isoformat(),
+        "service": "authentication-api"
+    }
+
