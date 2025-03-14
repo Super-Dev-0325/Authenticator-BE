@@ -372,6 +372,41 @@ async def resend_verification(request: Request, email_data: ResendVerificationRe
     
     return {"message": "Verification email sent"}
 
+@app.post("/password-reset")
+@limiter.limit("3/minute")
+async def password_reset(request: Request, reset_data: PasswordResetRequest, db: Session = Depends(get_db)):
+    """Request password reset"""
+    user = get_user_by_email(db, email=reset_data.email)
+    if not user:
+        # Don't reveal if user exists for security
+        return {"message": "If the email exists, a password reset link has been sent"}
+    
+    reset_token = secrets.token_urlsafe(32)
+    user.verification_token = reset_token  # Reuse field for reset token
+    db.commit()
+    
+    log_info(f"Password reset requested for user: {user.username}")
+    # In production, send email with reset link
+    print(f"Password reset token for {user.email}: {reset_token}")
+    
+    return {"message": "If the email exists, a password reset link has been sent"}
+
+@app.post("/password-reset/confirm")
+@limiter.limit("5/minute")
+async def password_reset_confirm(request: Request, reset_data: PasswordResetConfirm, db: Session = Depends(get_db)):
+    """Confirm password reset with token"""
+    user = db.query(User).filter(User.verification_token == reset_data.token).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Invalid or expired reset token")
+    
+    # Update password
+    user.hashed_password = get_password_hash(reset_data.new_password)
+    user.verification_token = None
+    db.commit()
+    
+    log_info(f"Password reset successful for user: {user.username}")
+    return {"message": "Password reset successful"}
+
 @app.get("/users/me", response_model=UserResponse)
 @limiter.limit("30/minute")
 async def read_users_me(request: Request, current_user: User = Depends(get_current_user)):
